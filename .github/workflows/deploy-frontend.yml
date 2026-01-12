@@ -11,14 +11,11 @@ concurrency:
   group: deploy-frontend
   cancel-in-progress: false
 
-<<<<<<< Updated upstream
-=======
 # Required for OIDC authentication
 permissions:
   id-token: write
   contents: read
 
->>>>>>> Stashed changes
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
 
@@ -47,18 +44,17 @@ jobs:
         env:
           REACT_APP_API_URL: ${{ vars.API_BASE_URL }}
       
-<<<<<<< Updated upstream
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-=======
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
->>>>>>> Stashed changes
+
           aws-region: ${{ secrets.AWS_REGION }}
       
       - name: Upload build to S3
@@ -67,11 +63,8 @@ jobs:
           aws s3 sync ./client/build s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/$TIMESTAMP/
           echo "DEPLOY_PATH=frontend/$TIMESTAMP" >> $GITHUB_ENV
           echo "📦 Uploaded to s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/$TIMESTAMP/"
-<<<<<<< Updated upstream
-      
-=======
 
->>>>>>> Stashed changes
+
       - name: Backup current deployment via SSM
         run: |
           echo "🔄 Creating backup of current deployment..."
@@ -123,10 +116,7 @@ jobs:
               break
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
               echo "❌ Deployment failed with status: $STATUS"
-<<<<<<< Updated upstream
-              # Get error output
-=======
->>>>>>> Stashed changes
+
               aws ssm get-command-invocation \
                 --command-id $COMMAND_ID \
                 --instance-id ${{ secrets.FRONTEND_INSTANCE_ID }} \
@@ -135,11 +125,6 @@ jobs:
             fi
             sleep 10
           done
-<<<<<<< Updated upstream
-      
-=======
-
->>>>>>> Stashed changes
       - name: Health check via SSM
         run: |
           echo "🏥 Running health check..."
@@ -166,10 +151,9 @@ jobs:
           echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Deployed by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-<<<<<<< Updated upstream
+
           echo "- **S3 Path:** s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_PATH }}/" >> $GITHUB_STEP_SUMMARY
-=======
->>>>>>> Stashed changes
+
       
       - name: Rollback on failure
         if: failure()
