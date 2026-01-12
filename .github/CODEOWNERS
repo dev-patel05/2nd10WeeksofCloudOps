@@ -11,14 +11,14 @@
 # CI/CD workflows
 /.github/ @dev-patel05
 =======
-* @your-github-username
+* @dev-patel05
 
 # Frontend specific
-/client/ @your-github-username
+/client/ @dev-patel05
 
 # Backend specific
-/backend/ @your-github-username
+/backend/ @dev-patel05
 
 # CI/CD workflows
-/.github/ @your-github-username
+/.github/ @dev-patel05
 >>>>>>> Stashed changes
