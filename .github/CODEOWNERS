@@ -1,0 +1,11 @@
+# Default owners for everything
+* @dev-patel05
+
+# Frontend specific
+/client/ @dev-patel05
+
+# Backend specific
+/backend/ @dev-patel05
+
+# CI/CD workflows
+/.github/ @dev-patel05
