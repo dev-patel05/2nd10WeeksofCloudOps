@@ -1,4 +1,5 @@
 # Default owners for everything
+<<<<<<< Updated upstream
 * @dev-patel05
 
 # Frontend specific
@@ -9,3 +10,15 @@
 
 # CI/CD workflows
 /.github/ @dev-patel05
+=======
+* @your-github-username
+
+# Frontend specific
+/client/ @your-github-username
+
+# Backend specific
+/backend/ @your-github-username
+
+# CI/CD workflows
+/.github/ @your-github-username
+>>>>>>> Stashed changes
