@@ -1,0 +1,175 @@
+name: Deploy Backend
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Package and upload backend code to S3
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          echo "📦 Packaging backend code..."
+          cd backend
+          zip -r ../backend-$TIMESTAMP.zip . -x "node_modules/*" -x ".env" -x "*.log"
+          cd ..
+          echo "☁️ Uploading to S3..."
+          aws s3 cp backend-$TIMESTAMP.zip s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/backend/backend-$TIMESTAMP.zip
+          echo "DEPLOY_FILE=backend/backend-$TIMESTAMP.zip" >> $GITHUB_ENV
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+          echo "✅ Uploaded to s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/backend/backend-$TIMESTAMP.zip"
+      
+      - name: Backup current deployment via SSM
+        run: |
+          echo "🔄 Creating backup of current deployment..."
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ secrets.BACKEND_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["cp -r ~/app ~/app.backup.$(date +%Y%m%d%H%M%S) 2>/dev/null || echo No existing deployment to backup"]' \
+            --query 'Command.CommandId' --output text)
+          
+          aws ssm wait command-executed \
+            --command-id $COMMAND_ID \
+            --instance-id ${{ secrets.BACKEND_INSTANCE_ID }} || true
+          echo "✅ Backup completed"
+      
+      - name: Deploy backend code via SSM
+        run: |
+          echo "🚀 Deploying backend code..."
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ secrets.BACKEND_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 600 \
+            --parameters commands='[
+              "echo === Starting Backend Deployment ===",
+              "echo Downloading from S3...",
+              "aws s3 cp s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_FILE }} /tmp/backend.zip",
+              "echo Extracting code...",
+              "rm -rf ~/app.new && mkdir -p ~/app.new",
+              "unzip -o /tmp/backend.zip -d ~/app.new",
+              "echo Preserving environment file...",
+              "cp ~/app/.env ~/app.new/.env 2>/dev/null || echo No .env to preserve",
+              "echo Installing dependencies...",
+              "cd ~/app.new && npm ci --production",
+              "echo Swapping deployments...",
+              "rm -rf ~/app.old 2>/dev/null || true",
+              "mv ~/app ~/app.old 2>/dev/null || true",
+              "mv ~/app.new ~/app",
+              "echo Restarting application...",
+              "cd ~/app && pm2 restart backendAPI 2>/dev/null || pm2 start index.js --name backendAPI",
+              "pm2 save",
+              "echo Cleaning up...",
+              "rm -f /tmp/backend.zip",
+              "echo === Deployment Complete ==="
+            ]' \
+            --query 'Command.CommandId' --output text)
+          
+          echo "Command ID: $COMMAND_ID"
+          echo "Waiting for deployment to complete (this may take a few minutes)..."
+          
+          for i in {1..60}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id $COMMAND_ID \
+              --instance-id ${{ secrets.BACKEND_INSTANCE_ID }} \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            
+            echo "Status: $STATUS (attempt $i/60)"
+            
+            if [ "$STATUS" = "Success" ]; then
+              echo "✅ Deployment completed successfully"
+              # Show output
+              aws ssm get-command-invocation \
+                --command-id $COMMAND_ID \
+                --instance-id ${{ secrets.BACKEND_INSTANCE_ID }} \
+                --query 'StandardOutputContent' --output text
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "❌ Deployment failed with status: $STATUS"
+              aws ssm get-command-invocation \
+                --command-id $COMMAND_ID \
+                --instance-id ${{ secrets.BACKEND_INSTANCE_ID }} \
+                --query 'StandardErrorContent' --output text
+              exit 1
+            fi
+            sleep 10
+          done
+      
+      - name: Health check via SSM
+        run: |
+          echo "🏥 Running health check..."
+          sleep 15
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ secrets.BACKEND_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["curl -sf http://localhost:80/books -o /dev/null && echo API health check passed || curl -sf http://localhost:3000/books -o /dev/null && echo API health check passed || exit 1"]' \
+            --query 'Command.CommandId' --output text)
+          
+          aws ssm wait command-executed \
+            --command-id $COMMAND_ID \
+            --instance-id ${{ secrets.BACKEND_INSTANCE_ID }} || {
+            echo "❌ Health check failed!"
+            exit 1
+          }
+          echo "✅ Health check passed"
+      
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "## 🎉 Backend Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3 Path:** s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_FILE }}" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "⚠️ Deployment failed, initiating rollback..."
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids ${{ secrets.BACKEND_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "LATEST_BACKUP=$(ls -td ~/app.backup.* 2>/dev/null | head -1)",
+              "if [ -n \"$LATEST_BACKUP\" ]; then",
+              "  echo Rolling back to $LATEST_BACKUP",
+              "  rm -rf ~/app",
+              "  cp -r $LATEST_BACKUP ~/app",
+              "  cd ~/app && npm ci --production",
+              "  pm2 restart backendAPI",
+              "  echo Rollback completed",
+              "else",
+              "  echo No backup found for rollback",
+              "fi"
+            ]' \
+            --query 'Command.CommandId' --output text)
+          
+          aws ssm wait command-executed \
+            --command-id $COMMAND_ID \
+            --instance-id ${{ secrets.BACKEND_INSTANCE_ID }} || true
+          echo "🔄 Rollback attempted"
