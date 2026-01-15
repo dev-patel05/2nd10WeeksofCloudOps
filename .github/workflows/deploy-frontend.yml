@@ -1,0 +1,99 @@
+name: Deploy Frontend
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-frontend
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: ./build
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Upload build to S3
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          aws s3 sync ./build s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/$TIMESTAMP/
+          aws s3 sync ./build s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/latest/
+          echo "DEPLOY_PATH=frontend/$TIMESTAMP" >> $GITHUB_ENV
+      
+      - name: Get ASG Instance IDs
+        run: |
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names ${{ secrets.FRONTEND_ASG_NAME }} \
+            --query 'AutoScalingGroups[0].Instances[*].InstanceId' \
+            --output text)
+          echo "INSTANCE_IDS=$INSTANCE_IDS" >> $GITHUB_ENV
+      
+      - name: Deploy to all instances via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=${{ secrets.FRONTEND_ASG_NAME }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands='[
+              "aws s3 sync s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_PATH }}/ /var/www/html/",
+              "sudo systemctl reload nginx"
+            ]' \
+            --query 'Command.CommandId' --output text)
+          
+          echo "Waiting for deployment to complete..."
+          sleep 30
+          
+          # Check status
+          STATUS=$(aws ssm list-command-invocations \
+            --command-id $COMMAND_ID \
+            --query 'CommandInvocations[0].Status' --output text)
+          
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Deployment failed with status: $STATUS"
+            exit 1
+          fi
+      
+      - name: Health check
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names ${{ secrets.FRONTEND_ALB_NAME }} \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          
+          sleep 10
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS/)
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Health check failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Health check passed!"
+      
+      - name: Notify success
+        if: success()
+        run: |
+          echo "✅ Frontend deployed successfully"
