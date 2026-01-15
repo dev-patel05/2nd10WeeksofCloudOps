@@ -1,0 +1,105 @@
+name: Deploy Backend
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package backend and upload to S3
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+
+          cd backend
+          zip -r ../backend-$TIMESTAMP.zip . \
+            -x "node_modules/*" \
+            -x ".env"
+
+          aws s3 cp ../backend-$TIMESTAMP.zip \
+            s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/backend/backend-$TIMESTAMP.zip
+
+          aws s3 cp ../backend-$TIMESTAMP.zip \
+            s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/backend/latest/backend.zip
+
+          echo "DEPLOY_FILE=backend/backend-$TIMESTAMP.zip" >> $GITHUB_ENV
+
+      - name: Deploy to EC2 instances via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=${{ secrets.BACKEND_ASG_NAME }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands='[
+              "cd /home/ec2-user",
+              "aws s3 cp s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_FILE }} /tmp/backend.zip",
+              "rm -rf app.new && mkdir -p app.new",
+              "unzip -o /tmp/backend.zip -d app.new",
+              "cp app/.env app.new/.env 2>/dev/null || true",
+              "cd app.new && npm ci --production",
+              "rm -rf ../app.old && mv ../app ../app.old 2>/dev/null || true",
+              "mv ../app.new ../app",
+              "cd ../app && pm2 restart backendAPI || pm2 start index.js --name backendAPI",
+              "pm2 save",
+              "rm -f /tmp/backend.zip"
+            ]' \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "Waiting for deployment to complete..."
+          sleep 60
+
+          STATUS=$(aws ssm list-command-invocations \
+            --command-id "$COMMAND_ID" \
+            --query 'CommandInvocations[0].Status' \
+            --output text)
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Deployment failed with status: $STATUS"
+            exit 1
+          fi
+
+      - name: Health check via ALB
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names ${{ secrets.BACKEND_ALB_NAME }} \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+
+          sleep 15
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://$ALB_DNS/books)
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Health check failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "Health check passed!"
