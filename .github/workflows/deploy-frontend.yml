@@ -156,16 +156,11 @@ jobs:
           # Get first instance ID for health check
           FIRST_INSTANCE=$(echo "${{ env.INSTANCE_IDS }}" | awk '{print $1}')
           
+          # Simple health check - just curl and check exit code
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$FIRST_INSTANCE" \
             --document-name "AWS-RunShellScript" \
-            --parameters commands="[
-              \"sleep 3\",
-              \"HTTP_CODE=\\$(curl -s -o /dev/null -w '%{http_code}' http://localhost/ --max-time 10)\",
-              \"echo HTTP_CODE=\\$HTTP_CODE\",
-              \"if [ \\\"\\$HTTP_CODE\\\" != \\\"200\\\" ]; then echo HEALTH_CHECK_FAILED; exit 1; fi\",
-              \"echo HEALTH_CHECK_PASSED\"
-            ]" \
+            --parameters 'commands=["sleep 3","curl -f http://localhost/ --max-time 10 && echo HEALTH_CHECK_PASSED"]' \
             --timeout-seconds 60 \
             --query 'Command.CommandId' --output text)
           
