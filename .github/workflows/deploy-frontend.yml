@@ -15,15 +15,13 @@ concurrency:
 permissions:
   id-token: write
   contents: read
-  actions: read
 
 env:
-  AWS_REGION: us-east-1
+  S3_BUCKET: ${{ secrets.S3_DEPLOYMENT_BUCKET }}
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -40,153 +38,134 @@ jobs:
           cd client
           npm ci
           npm run build
-          mv build ../build
         env:
           REACT_APP_API_URL: ${{ vars.API_BASE_URL }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: client/build/
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - region: us-east-1
+            asg_name_secret: FRONTEND_ASG_NAME
+          - region: us-west-1
+            asg_name_secret: FRONTEND_ASG_NAME_SECONDARY
+      fail-fast: false
+    
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: ./build
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ matrix.region }}
 
       - name: Upload build to S3
         run: |
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          
-          # Upload timestamped version
-          aws s3 sync ./build s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/$TIMESTAMP/
-          
-          # Upload as latest (for new ASG instances)
-          aws s3 sync ./build s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/latest/
-          
-          echo "DEPLOY_PATH=frontend/$TIMESTAMP" >> $GITHUB_ENV
-          echo "✅ Uploaded to s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/$TIMESTAMP/"
+          aws s3 sync ./build s3://${{ env.S3_BUCKET }}/frontend/$TIMESTAMP/
+          aws s3 sync ./build s3://${{ env.S3_BUCKET }}/frontend/latest/
+          echo "✅ Uploaded to S3"
 
       - name: Get ASG Instance IDs
         id: get-instances
         run: |
+          ASG_NAME="${{ secrets[matrix.asg_name_secret] }}"
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names ${{ secrets.FRONTEND_ASG_NAME }} \
+            --auto-scaling-group-names "$ASG_NAME" \
             --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
             --output text)
           
           if [ -z "$INSTANCE_IDS" ]; then
-            echo "::warning::No InService instances found in ASG"
+            echo "::warning::No InService instances found in $ASG_NAME"
             echo "INSTANCE_COUNT=0" >> $GITHUB_ENV
           else
             INSTANCE_COUNT=$(echo "$INSTANCE_IDS" | wc -w)
-            echo "Found $INSTANCE_COUNT instance(s): $INSTANCE_IDS"
+            echo "Found $INSTANCE_COUNT instance(s) in $ASG_NAME: $INSTANCE_IDS"
             echo "INSTANCE_IDS=$INSTANCE_IDS" >> $GITHUB_ENV
             echo "INSTANCE_COUNT=$INSTANCE_COUNT" >> $GITHUB_ENV
+            echo "ASG_NAME=$ASG_NAME" >> $GITHUB_ENV
           fi
 
-      - name: Deploy to all ASG instances via SSM
+      - name: Deploy to ASG instances via SSM
         if: env.INSTANCE_COUNT != '0'
         run: |
-          echo "🚀 Deploying to ${{ env.INSTANCE_COUNT }} instance(s)..."
+          echo "🚀 Deploying to ${{ matrix.region }} (${{ env.INSTANCE_COUNT }} instances)..."
           
-          # Use latest path for consistency (already uploaded)
-          # Amazon Linux 2023 uses /usr/share/nginx/html/ as document root
           COMMAND_ID=$(aws ssm send-command \
-            --targets "Key=tag:aws:autoscaling:groupName,Values=${{ secrets.FRONTEND_ASG_NAME }}" \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=${{ env.ASG_NAME }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters commands="[
-              \"echo Downloading frontend build from S3...\",
-              \"aws s3 sync s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/latest/ /tmp/frontend-build/\",
-              \"echo Deploying to web server...\",
-              \"sudo rm -rf /usr/share/nginx/html/*\",
-              \"sudo cp -r /tmp/frontend-build/* /usr/share/nginx/html/\",
-              \"sudo chown -R nginx:nginx /usr/share/nginx/html/\",
-              \"sudo systemctl reload nginx\",
-              \"rm -rf /tmp/frontend-build\",
-              \"echo Deployment complete!\"
-            ]" \
+            --parameters 'commands=["aws s3 sync s3://${{ env.S3_BUCKET }}/frontend/latest/ /usr/share/nginx/html/","chown -R nginx:nginx /usr/share/nginx/html/","systemctl reload nginx","echo Done"]' \
             --timeout-seconds 120 \
             --query 'Command.CommandId' --output text)
           
           echo "Command ID: $COMMAND_ID"
-          echo "COMMAND_ID=$COMMAND_ID" >> $GITHUB_ENV
           
-          # Wait for command to complete on all instances
-          echo "Waiting for deployment to complete on all instances..."
           for i in {1..20}; do
             STATUSES=$(aws ssm list-command-invocations \
               --command-id $COMMAND_ID \
               --query 'CommandInvocations[*].[InstanceId,Status]' \
               --output text)
-            
-            echo "Status check $i/20:"
-            echo "$STATUSES"
+            echo "Status check $i/20: $STATUSES"
             
             PENDING=$(echo "$STATUSES" | grep -E "Pending|InProgress" | wc -l)
             FAILED=$(echo "$STATUSES" | grep -E "Failed|Cancelled|TimedOut" | wc -l)
             
             if [ "$FAILED" -gt 0 ]; then
-              echo "::error::Deployment failed on one or more instances"
+              echo "::error::Deployment failed in ${{ matrix.region }}"
               exit 1
             fi
             
             if [ "$PENDING" -eq 0 ]; then
-              echo "✅ All instances deployed successfully"
+              echo "✅ ${{ matrix.region }} deployed successfully"
               break
             fi
-            
             sleep 5
           done
 
       - name: Health check via SSM
         if: env.INSTANCE_COUNT != '0'
         run: |
-          echo "Running health check from inside the instance via SSM..."
-          
-          # Get first instance ID for health check
           FIRST_INSTANCE=$(echo "${{ env.INSTANCE_IDS }}" | awk '{print $1}')
           
-          # Simple health check - just curl and check exit code
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$FIRST_INSTANCE" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["sleep 3","curl -f http://localhost/ --max-time 10 && echo HEALTH_CHECK_PASSED"]' \
+            --parameters 'commands=["curl -f http://localhost/ --max-time 10 && echo HEALTH_CHECK_PASSED"]' \
             --timeout-seconds 60 \
             --query 'Command.CommandId' --output text)
           
-          echo "Health check command ID: $COMMAND_ID"
-          
-          # Wait for health check to complete
           for i in {1..12}; do
             STATUS=$(aws ssm get-command-invocation \
               --command-id $COMMAND_ID \
               --instance-id "$FIRST_INSTANCE" \
               --query 'Status' --output text 2>/dev/null || echo "Pending")
             
-            echo "Health check status: $STATUS"
-            
             if [ "$STATUS" = "Success" ]; then
-              echo "✅ Health check passed"
+              echo "✅ Health check passed in ${{ matrix.region }}"
               break
-            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-              # Get output for debugging
-              aws ssm get-command-invocation \
-                --command-id $COMMAND_ID \
-                --instance-id "$FIRST_INSTANCE" \
-                --query 'StandardOutputContent' --output text || true
-              echo "::error::Health check failed"
+            elif [ "$STATUS" = "Failed" ]; then
+              echo "::error::Health check failed in ${{ matrix.region }}"
               exit 1
             fi
-            
             sleep 5
           done
 
       - name: Deployment summary
         if: success()
         run: |
-          echo "## ✅ Frontend Deployment Successful!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Deployed by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Frontend deployed to ${{ matrix.region }}" >> $GITHUB_STEP_SUMMARY
           echo "| Instances | ${{ env.INSTANCE_COUNT }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| S3 Path | \`s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_PATH }}/\` |" >> $GITHUB_STEP_SUMMARY
