@@ -32,68 +32,149 @@ jobs:
           path: ./build
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        id: download-artifact
+
+      - name: Checkout and build if no artifact
+        if: steps.download-artifact.outcome == 'failure'
+        uses: actions/checkout@v4
       
+      - name: Setup Node.js (fallback build)
+        if: steps.download-artifact.outcome == 'failure'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+      
+      - name: Build frontend (fallback)
+        if: steps.download-artifact.outcome == 'failure'
+        run: |
+          cd client
+          npm ci
+          npm run build
+          mv build ../build
+        env:
+          REACT_APP_API_URL: ${{ vars.API_BASE_URL }}
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      
+
       - name: Upload build to S3
         run: |
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          
+          # Upload timestamped version
           aws s3 sync ./build s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/$TIMESTAMP/
+          
+          # Upload as latest (for new ASG instances)
           aws s3 sync ./build s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/latest/
+          
           echo "DEPLOY_PATH=frontend/$TIMESTAMP" >> $GITHUB_ENV
-      
+          echo "✅ Uploaded to s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/$TIMESTAMP/"
+
       - name: Get ASG Instance IDs
+        id: get-instances
         run: |
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names ${{ secrets.FRONTEND_ASG_NAME }} \
-            --query 'AutoScalingGroups[0].Instances[*].InstanceId' \
+            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
             --output text)
-          echo "INSTANCE_IDS=$INSTANCE_IDS" >> $GITHUB_ENV
-      
-      - name: Deploy to all instances via SSM
+          
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "::warning::No InService instances found in ASG"
+            echo "INSTANCE_COUNT=0" >> $GITHUB_ENV
+          else
+            INSTANCE_COUNT=$(echo "$INSTANCE_IDS" | wc -w)
+            echo "Found $INSTANCE_COUNT instance(s): $INSTANCE_IDS"
+            echo "INSTANCE_IDS=$INSTANCE_IDS" >> $GITHUB_ENV
+            echo "INSTANCE_COUNT=$INSTANCE_COUNT" >> $GITHUB_ENV
+          fi
+
+      - name: Deploy to all ASG instances via SSM
+        if: env.INSTANCE_COUNT != '0'
         run: |
+          echo "🚀 Deploying to ${{ env.INSTANCE_COUNT }} instance(s)..."
+          
+          # Use latest path for consistency (already uploaded)
           COMMAND_ID=$(aws ssm send-command \
             --targets "Key=tag:aws:autoscaling:groupName,Values=${{ secrets.FRONTEND_ASG_NAME }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters commands='[
-              "aws s3 sync s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_PATH }}/ /var/www/html/",
-              "sudo systemctl reload nginx"
-            ]' \
+            --parameters commands="[
+              \"echo Downloading frontend build from S3...\",
+              \"aws s3 sync s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/frontend/latest/ /tmp/frontend-build/\",
+              \"echo Deploying to web server...\",
+              \"sudo rm -rf /var/www/html/*\",
+              \"sudo cp -r /tmp/frontend-build/* /var/www/html/\",
+              \"sudo chown -R nginx:nginx /var/www/html/ 2>/dev/null || sudo chown -R www-data:www-data /var/www/html/\",
+              \"sudo systemctl reload nginx 2>/dev/null || sudo systemctl reload apache2\",
+              \"rm -rf /tmp/frontend-build\",
+              \"echo Deployment complete!\"
+            ]" \
+            --timeout-seconds 120 \
             --query 'Command.CommandId' --output text)
           
-          echo "Waiting for deployment to complete..."
-          sleep 30
+          echo "Command ID: $COMMAND_ID"
+          echo "COMMAND_ID=$COMMAND_ID" >> $GITHUB_ENV
           
-          # Check status
-          STATUS=$(aws ssm list-command-invocations \
-            --command-id $COMMAND_ID \
-            --query 'CommandInvocations[0].Status' --output text)
-          
-          if [ "$STATUS" != "Success" ]; then
-            echo "::error::Deployment failed with status: $STATUS"
-            exit 1
-          fi
-      
-      - name: Health check
+          # Wait for command to complete on all instances
+          echo "Waiting for deployment to complete on all instances..."
+          for i in {1..20}; do
+            STATUSES=$(aws ssm list-command-invocations \
+              --command-id $COMMAND_ID \
+              --query 'CommandInvocations[*].[InstanceId,Status]' \
+              --output text)
+            
+            echo "Status check $i/20:"
+            echo "$STATUSES"
+            
+            PENDING=$(echo "$STATUSES" | grep -E "Pending|InProgress" | wc -l)
+            FAILED=$(echo "$STATUSES" | grep -E "Failed|Cancelled|TimedOut" | wc -l)
+            
+            if [ "$FAILED" -gt 0 ]; then
+              echo "::error::Deployment failed on one or more instances"
+              exit 1
+            fi
+            
+            if [ "$PENDING" -eq 0 ]; then
+              echo "✅ All instances deployed successfully"
+              break
+            fi
+            
+            sleep 5
+          done
+
+      - name: Health check via ALB
         run: |
           ALB_DNS=$(aws elbv2 describe-load-balancers \
             --names ${{ secrets.FRONTEND_ALB_NAME }} \
             --query 'LoadBalancers[0].DNSName' --output text)
           
+          echo "Waiting for services to stabilize..."
           sleep 10
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS/)
+          
+          echo "Checking health at http://$ALB_DNS/"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/" --max-time 10)
           
           if [ "$HTTP_CODE" != "200" ]; then
             echo "::error::Health check failed with HTTP $HTTP_CODE"
             exit 1
           fi
-          echo "Health check passed!"
-      
-      - name: Notify success
+          
+          echo "✅ Health check passed (HTTP $HTTP_CODE)"
+
+      - name: Deployment summary
         if: success()
         run: |
-          echo "✅ Frontend deployed successfully"
+          echo "## ✅ Frontend Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployed by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Instances | ${{ env.INSTANCE_COUNT }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| S3 Path | \`s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_PATH }}/\` |" >> $GITHUB_STEP_SUMMARY

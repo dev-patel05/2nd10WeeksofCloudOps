@@ -23,7 +23,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
-
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,69 +37,125 @@ jobs:
       - name: Package backend and upload to S3
         run: |
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-
           cd backend
-          zip -r ../backend-$TIMESTAMP.zip . \
-            -x "node_modules/*" \
-            -x ".env"
-
+          zip -r ../backend-$TIMESTAMP.zip . -x "node_modules/*" -x ".env"
+          
+          # Upload timestamped version
           aws s3 cp ../backend-$TIMESTAMP.zip \
             s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/backend/backend-$TIMESTAMP.zip
-
+          
+          # Upload as latest (for new ASG instances)
           aws s3 cp ../backend-$TIMESTAMP.zip \
             s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/backend/latest/backend.zip
-
+          
           echo "DEPLOY_FILE=backend/backend-$TIMESTAMP.zip" >> $GITHUB_ENV
+          echo "✅ Uploaded to s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/backend/backend-$TIMESTAMP.zip"
 
-      - name: Deploy to EC2 instances via SSM
+      - name: Get ASG Instance IDs
+        id: get-instances
         run: |
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names ${{ secrets.BACKEND_ASG_NAME }} \
+            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+            --output text)
+          
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "::warning::No InService instances found in ASG"
+            echo "INSTANCE_COUNT=0" >> $GITHUB_ENV
+          else
+            INSTANCE_COUNT=$(echo "$INSTANCE_IDS" | wc -w)
+            echo "Found $INSTANCE_COUNT instance(s): $INSTANCE_IDS"
+            echo "INSTANCE_IDS=$INSTANCE_IDS" >> $GITHUB_ENV
+            echo "INSTANCE_COUNT=$INSTANCE_COUNT" >> $GITHUB_ENV
+          fi
+
+      - name: Deploy to all ASG instances via SSM
+        if: env.INSTANCE_COUNT != '0'
+        run: |
+          echo "🚀 Deploying to ${{ env.INSTANCE_COUNT }} instance(s)..."
+          
+          # Use latest path for consistency
           COMMAND_ID=$(aws ssm send-command \
             --targets "Key=tag:aws:autoscaling:groupName,Values=${{ secrets.BACKEND_ASG_NAME }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters commands='[
-              "cd /home/ec2-user",
-              "aws s3 cp s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_FILE }} /tmp/backend.zip",
-              "rm -rf app.new && mkdir -p app.new",
-              "unzip -o /tmp/backend.zip -d app.new",
-              "cp app/.env app.new/.env 2>/dev/null || true",
-              "cd app.new && npm ci --production",
-              "rm -rf ../app.old && mv ../app ../app.old 2>/dev/null || true",
-              "mv ../app.new ../app",
-              "cd ../app && pm2 restart backendAPI || pm2 start index.js --name backendAPI",
-              "pm2 save",
-              "rm -f /tmp/backend.zip"
-            ]' \
-            --query 'Command.CommandId' \
-            --output text)
-
-          echo "Waiting for deployment to complete..."
-          sleep 60
-
-          STATUS=$(aws ssm list-command-invocations \
-            --command-id "$COMMAND_ID" \
-            --query 'CommandInvocations[0].Status' \
-            --output text)
-
-          if [ "$STATUS" != "Success" ]; then
-            echo "::error::Deployment failed with status: $STATUS"
-            exit 1
-          fi
+            --parameters commands="[
+              \"cd /home/ec2-user\",
+              \"echo Downloading deployment package...\",
+              \"aws s3 cp s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/backend/latest/backend.zip /tmp/backend.zip\",
+              \"echo Extracting and deploying...\",
+              \"rm -rf app.new && mkdir -p app.new\",
+              \"unzip -o /tmp/backend.zip -d app.new\",
+              \"cp app/.env app.new/.env 2>/dev/null || echo No existing .env to preserve\",
+              \"cd app.new && npm ci --production\",
+              \"rm -rf ../app.old && mv ../app ../app.old 2>/dev/null || true\",
+              \"mv ../app.new ../app\",
+              \"cd ../app && pm2 restart backendAPI || pm2 start index.js --name backendAPI\",
+              \"pm2 save\",
+              \"rm -f /tmp/backend.zip\",
+              \"echo Deployment complete!\"
+            ]" \
+            --timeout-seconds 300 \
+            --query 'Command.CommandId' --output text)
+          
+          echo "Command ID: $COMMAND_ID"
+          echo "COMMAND_ID=$COMMAND_ID" >> $GITHUB_ENV
+          
+          # Wait for command to complete on all instances
+          echo "Waiting for deployment to complete on all instances..."
+          for i in {1..30}; do
+            STATUSES=$(aws ssm list-command-invocations \
+              --command-id $COMMAND_ID \
+              --query 'CommandInvocations[*].[InstanceId,Status]' \
+              --output text)
+            
+            echo "Status check $i/30:"
+            echo "$STATUSES"
+            
+            # Check if all are complete
+            PENDING=$(echo "$STATUSES" | grep -E "Pending|InProgress" | wc -l)
+            FAILED=$(echo "$STATUSES" | grep -E "Failed|Cancelled|TimedOut" | wc -l)
+            
+            if [ "$FAILED" -gt 0 ]; then
+              echo "::error::Deployment failed on one or more instances"
+              exit 1
+            fi
+            
+            if [ "$PENDING" -eq 0 ]; then
+              echo "✅ All instances deployed successfully"
+              break
+            fi
+            
+            sleep 10
+          done
 
       - name: Health check via ALB
         run: |
           ALB_DNS=$(aws elbv2 describe-load-balancers \
             --names ${{ secrets.BACKEND_ALB_NAME }} \
-            --query 'LoadBalancers[0].DNSName' \
-            --output text)
-
+            --query 'LoadBalancers[0].DNSName' --output text)
+          
+          echo "Waiting for services to stabilize..."
           sleep 15
-
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            http://$ALB_DNS/books)
-
+          
+          echo "Checking health at http://$ALB_DNS/books"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/books" --max-time 10)
+          
           if [ "$HTTP_CODE" != "200" ]; then
             echo "::error::Health check failed with HTTP $HTTP_CODE"
             exit 1
           fi
+          
+          echo "✅ Health check passed (HTTP $HTTP_CODE)"
 
-          echo "Health check passed!"
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "## ✅ Backend Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployed by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Instances | ${{ env.INSTANCE_COUNT }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| S3 Path | \`s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${{ env.DEPLOY_FILE }}\` |" >> $GITHUB_STEP_SUMMARY
