@@ -14,7 +14,7 @@ jest.mock('axios', () => ({
 
 test('renders book shop heading', () => {
   render(<App />);
-  const headingElement = screen.getByText(/Ankit book Shop/i);
+  const headingElement = screen.getByText(/Dev's book Shop/i);
   expect(headingElement).toBeInTheDocument();
 });
 
