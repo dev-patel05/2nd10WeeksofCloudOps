@@ -128,24 +128,53 @@ jobs:
             sleep 10
           done
 
-      - name: Health check via ALB
+      - name: Health check via SSM
+        if: env.INSTANCE_COUNT != '0'
         run: |
-          ALB_DNS=$(aws elbv2 describe-load-balancers \
-            --names ${{ secrets.BACKEND_ALB_NAME }} \
-            --query 'LoadBalancers[0].DNSName' --output text)
+          echo "Running health check from inside the instance via SSM..."
           
-          echo "Waiting for services to stabilize..."
-          sleep 15
+          # Get first instance ID for health check
+          FIRST_INSTANCE=$(echo "${{ env.INSTANCE_IDS }}" | awk '{print $1}')
           
-          echo "Checking health at http://$ALB_DNS/books"
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$ALB_DNS/books" --max-time 10)
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$FIRST_INSTANCE" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands="[
+              \"sleep 5\",
+              \"HTTP_CODE=\\$(curl -s -o /dev/null -w '%{http_code}' http://localhost/books --max-time 10)\",
+              \"echo HTTP_CODE=\\$HTTP_CODE\",
+              \"if [ \\\"\\$HTTP_CODE\\\" != \\\"200\\\" ]; then echo HEALTH_CHECK_FAILED; exit 1; fi\",
+              \"echo HEALTH_CHECK_PASSED\"
+            ]" \
+            --timeout-seconds 60 \
+            --query 'Command.CommandId' --output text)
           
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::Health check failed with HTTP $HTTP_CODE"
-            exit 1
-          fi
+          echo "Health check command ID: $COMMAND_ID"
           
-          echo "✅ Health check passed (HTTP $HTTP_CODE)"
+          # Wait for health check to complete
+          for i in {1..12}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id $COMMAND_ID \
+              --instance-id "$FIRST_INSTANCE" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            
+            echo "Health check status: $STATUS"
+            
+            if [ "$STATUS" = "Success" ]; then
+              echo "✅ Health check passed"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              # Get output for debugging
+              aws ssm get-command-invocation \
+                --command-id $COMMAND_ID \
+                --instance-id "$FIRST_INSTANCE" \
+                --query 'StandardOutputContent' --output text || true
+              echo "::error::Health check failed"
+              exit 1
+            fi
+            
+            sleep 5
+          done
 
       - name: Deployment summary
         if: success()
