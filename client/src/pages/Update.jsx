@@ -57,7 +57,7 @@ const Update = () => {
       />
       <input
         type="text"
-        placeholder="Book cover"
+        placeholder="Image Link"
         name="cover"
         onChange={handleChange}
       />
