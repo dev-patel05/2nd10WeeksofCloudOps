@@ -7,14 +7,23 @@ import API_BASE_URL from "./config";
 
 const Books = () => {
   const [books, setBooks] = useState([]);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     const fetchAllBooks = async () => {
       try {
         const res = await axios.get(`${API_BASE_URL}/books`);
-        setBooks(res.data);
+        if (Array.isArray(res.data)) {
+          setBooks(res.data);
+          setError(null);
+        } else {
+          setError('Unable to load books. Please try again later.');
+          setBooks([]);
+        }
       } catch (err) {
         console.log(err);
+        setError('Unable to connect to server. Please try again later.');
+        setBooks([]);
       }
     };
     fetchAllBooks();
@@ -34,6 +43,7 @@ const Books = () => {
   return (
     <div>
       <h1>Dev's book Shop</h1>
+      {error && <p style={{color: 'red', textAlign: 'center'}}>{error}</p>}
       <div className="books">
         {books.map((book) => (
           <div key={book.id} className="book">
