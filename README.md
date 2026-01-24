@@ -4,7 +4,7 @@ A production-ready 3-tier application deployed across multiple AWS regions with 
 
 ## Architecture
 
-![Architecture of the application](architecture_diagram (1).png)
+![Architecture of the application](architecture_diagram.png)
 
 ### Architecture Highlights
 
