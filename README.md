@@ -1,8 +1,8 @@
-# 🚀 Multi-Region Resilient AWS Architecture with Automated Disaster Recovery
+# Multi-Region Resilient AWS Architecture with Automated Disaster Recovery
 
 A production-ready 3-tier application deployed across multiple AWS regions with automated failover, CI/CD pipelines, and disaster recovery capabilities.
 
-## 🏠 Architecture
+## Architecture
 
 ![Architecture of the application](architecture.gif)
 
@@ -28,7 +28,7 @@ A production-ready 3-tier application deployed across multiple AWS regions with 
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 | Layer | Technology |
 |-------|------------|
@@ -41,28 +41,29 @@ A production-ready 3-tier application deployed across multiple AWS regions with 
 
 ---
 
-## � Project Structure
+## Project Structure
 
 ```
-├── client/                 # React frontend application
+├── client/                     # React frontend application
 │   ├── src/
 │   │   └── pages/
-│   │       └── config.js   # API endpoint configuration
+│   │       └── config.js       # API endpoint configuration
 │   └── package.json
-├── backend/                # Node.js backend API
-│   ├── index.js            # Express server
-│   ├── test.sql            # Database schema
+├── backend/                    # Node.js backend API
+│   ├── index.js                # Express server
+│   ├── test.sql                # Database schema
 │   └── package.json
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml          # CI pipeline (test, lint, security scan)
-│       └── deploy-backend.yml  # CD pipeline (deploy to both regions)
+│       ├── ci.yml              # CI pipeline (test, lint, security scan)
+│       ├── deploy-backend.yml  # Backend CD pipeline (deploy to both regions)
+│       └── deploy-frontend.yml # Frontend CD pipeline (deploy to both regions)
 └── README.md
 ```
 
 ---
 
-## 🖥️ Local Development Setup
+## Local Development Setup
 
 ### Prerequisites
 
@@ -123,7 +124,7 @@ pm2 start index.js --name "backendAPI"
 
 ---
 
-## ☁️ AWS Deployment
+## AWS Deployment
 
 ### Infrastructure Components
 
@@ -153,44 +154,44 @@ pm2 start index.js --name "backendAPI"
 
 ---
 
-## 🔄 CI/CD Pipeline
+## CI/CD Pipeline
 
 ### Continuous Integration (ci.yml)
 
 Triggers on push to `main` or `develop`:
 
-- ✅ Change detection (only build what changed)
-- ✅ Dependency installation
-- ✅ Linting
-- ✅ Testing
-- ✅ Security scanning (npm audit, Gitleaks, CodeQL)
-- ✅ Build artifacts
+- Change detection (only build what changed)
+- Dependency installation
+- Linting
+- Testing
+- Security scanning (npm audit, Gitleaks, CodeQL)
+- Build artifacts
 
 ### Continuous Deployment
 
 **Backend (deploy-backend.yml)** - Triggers on push to `main`:
 
-- ✅ Package application
-- ✅ Upload to S3
-- ✅ Deploy to both regions in parallel
-- ✅ SSM-based deployment (no SSH)
-- ✅ Health checks after deployment
+- Package application
+- Upload to S3
+- Deploy to both regions in parallel
+- SSM-based deployment (no SSH)
+- Health checks after deployment
 
 **Frontend (deploy-frontend.yml)** - Triggers on push to `main`:
 
-- ✅ Build React application
-- ✅ Upload to S3
-- ✅ Deploy to both regions in parallel
-- ✅ Sync to Nginx html directory via SSM
-- ✅ Health checks after deployment
+- Build React application
+- Upload to S3
+- Deploy to both regions in parallel
+- Sync to Nginx html directory via SSM
+- Health checks after deployment
 
 ---
 
-## 🚨 Automated RDS Failover
+## Automated RDS Failover
 
 When the primary RDS becomes unavailable:
 
-1. **CloudWatch Alarm** detects alb health check fails for both frontend and backend 
+1. **CloudWatch Alarm** detects ALB health check fails for both frontend and backend
 2. **SNS** triggers Lambda function
 3. **Lambda** promotes read replica to standalone primary
 4. **Lambda** enables Multi-AZ on new primary
@@ -200,9 +201,7 @@ The us-west-1 backend already has the replica endpoint configured, so no DNS upd
 
 ---
 
-
-
-## 🙏 Credits
+## Credits
 
 This project was inspired by [Ankit Joshipura's](https://github.com/AnkitJoshipura) architecture from the **#10WeeksOfCloudOps** challenge organized by [Piyush Sachdeva](https://github.com/piyushsachdeva).
 
@@ -217,10 +216,10 @@ This project was inspired by [Ankit Joshipura's](https://github.com/AnkitJoshipu
 
 ---
 
-## 📄 License
+## License
 
 This project is for educational purposes.
 
 ---
 
-**Thank you for reading! ⭐**
+**Thank you for reading!**
