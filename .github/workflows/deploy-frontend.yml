@@ -108,7 +108,7 @@ jobs:
           COMMAND_ID=$(aws ssm send-command \
             --targets "Key=tag:aws:autoscaling:groupName,Values=${{ env.ASG_NAME }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["aws s3 sync s3://${{ env.S3_BUCKET }}/frontend/latest/ /usr/share/nginx/html/","chown -R nginx:nginx /usr/share/nginx/html/","systemctl reload nginx","echo Done"]' \
+            --parameters 'commands=["aws s3 sync s3://${{ env.S3_BUCKET }}/frontend/latest/ /var/www/html/","chown -R www-data:www-data /var/www/html/","systemctl reload nginx","echo Done"]' \
             --timeout-seconds 120 \
             --query 'Command.CommandId' --output text)
           
