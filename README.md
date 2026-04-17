@@ -172,18 +172,25 @@ Triggers on push to `main` or `develop`:
 **Backend (deploy-backend.yml)** - Triggers on push to `main`:
 
 - Package application
-- Upload to S3
-- Deploy to both regions in parallel
-- SSM-based deployment (no SSH)
+- Upload to S3 (`s3://3tier-deployment-2035932219`)
+- Deploy to both regions in parallel (us-east-1 & us-west-1)
+- SSM-based deployment (no SSH required)
 - Health checks after deployment
+- Zero-downtime deployment with rolling updates
 
 **Frontend (deploy-frontend.yml)** - Triggers on push to `main`:
 
-- Build React application
-- Upload to S3
-- Deploy to both regions in parallel
+- Build React application with production config
+- Upload to S3 (`s3://3tier-deployment-2035932219`)
+- Deploy to both regions in parallel (us-east-1 & us-west-1)
 - Sync to Nginx html directory via SSM
 - Health checks after deployment
+- Automatic cache invalidation
+
+### Deployment URLs
+
+- **Production Frontend:** https://pateldev.in
+- **Production Backend API:** https://api.pateldev.in
 
 ---
 
