@@ -44,7 +44,7 @@ const Books = () => {
     <div>
       <h1>Dev's Book Shop</h1>
       <p style={{textAlign: 'center', color: '#666', marginBottom: '20px'}}>
-        Multi-Region AWS Architecture with Automated CI/CD
+        Multi-Region AWS Architecture - Automated CI/CD
       </p>
       {error && <p style={{color: 'red', textAlign: 'center'}}>{error}</p>}
       <div className="books">
