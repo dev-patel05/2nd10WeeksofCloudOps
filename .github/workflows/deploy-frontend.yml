@@ -36,7 +36,7 @@ jobs:
       - name: Build frontend
         run: |
           cd client
-          npm ci
+          npm ci || npm install
           npm run build
         env:
           REACT_APP_API_URL: ${{ vars.API_BASE_URL }}
