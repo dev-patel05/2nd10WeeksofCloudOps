@@ -42,7 +42,7 @@ const Books = () => {
 
   return (
     <div>
-      <h1>ankit's Book Shop</h1>
+      <h1>dev's Book Shop</h1>
       <p style={{textAlign: 'center', color: '#666', marginBottom: '20px'}}>
         Multi-Region AWS Architecture - Automated CI/CD
       </p>
