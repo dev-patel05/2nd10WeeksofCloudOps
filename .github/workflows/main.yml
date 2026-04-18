@@ -1,0 +1,188 @@
+name: Main CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+env:
+  S3_BUCKET: ${{ secrets.S3_DEPLOYMENT_BUCKET }}
+
+jobs:
+  # Detect changes
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'client/**'
+            backend:
+              - 'backend/**'
+
+  # Frontend CI
+  frontend-ci:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run tests
+        run: npm test -- --watchAll=false --passWithNoTests
+      
+      - name: Build application
+        run: npm run build
+        env:
+          REACT_APP_API_URL: ${{ vars.API_BASE_URL }}
+      
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build-${{ github.sha }}
+          path: client/build/
+          retention-days: 7
+
+  # Backend CI
+  backend-ci:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Create test environment file
+        run: |
+          cp .env.example .env.test
+          echo "NODE_ENV=test" >> .env.test
+      
+      - name: Run tests
+        run: npm test --if-present
+        env:
+          NODE_ENV: test
+      
+      - name: Package backend
+        run: |
+          zip -r ../backend-${{ github.sha }}.zip . -x "node_modules/*" -x ".env*" -x "*.test.js"
+      
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-package-${{ github.sha }}
+          path: backend-${{ github.sha }}.zip
+          retention-days: 7
+
+  # Security scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: [frontend-ci, backend-ci]
+    if: always() && (needs.frontend-ci.result == 'success' || needs.frontend-ci.result == 'skipped') && (needs.backend-ci.result == 'success' || needs.backend-ci.result == 'skipped')
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Deploy to staging (develop branch)
+  deploy-staging:
+    needs: [changes, frontend-ci, backend-ci, security-scan]
+    if: github.ref == 'refs/heads/develop' && (needs.frontend-ci.result == 'success' || needs.backend-ci.result == 'success')
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+      - name: Deploy to staging
+        run: |
+          echo "🚀 Deploying to staging environment..."
+          echo "This would deploy to staging instances"
+
+  # Deploy to production (main branch)
+  deploy-production:
+    needs: [changes, frontend-ci, backend-ci, security-scan]
+    if: github.ref == 'refs/heads/main' && (needs.frontend-ci.result == 'success' || needs.backend-ci.result == 'success')
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Deploy Frontend
+        if: needs.changes.outputs.frontend == 'true' || github.event_name == 'workflow_dispatch'
+        uses: ./.github/workflows/deploy-frontend.yml
+        with:
+          artifact-name: frontend-build-${{ github.sha }}
+
+      - name: Deploy Backend
+        if: needs.changes.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
+        uses: ./.github/workflows/deploy-backend.yml
+        with:
+          artifact-name: backend-package-${{ github.sha }}
+
+  # Notification
+  notify:
+    needs: [deploy-production]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Deployment Status
+        run: |
+          if [ "${{ needs.deploy-production.result }}" == "success" ]; then
+            echo "✅ Production deployment successful!"
+            echo "🌐 Frontend: https://pateldev.in"
+            echo "🔗 Backend: https://api.pateldev.in"
+          else
+            echo "❌ Production deployment failed!"
+          fi
